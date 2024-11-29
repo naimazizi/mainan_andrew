@@ -1,21 +1,217 @@
 from openai import OpenAI
 import streamlit as st
+import gc
+import os
+import re
+import nltk
+import torch
+import pickle
+import joblib
+
+import numpy as np
+import pandas as pd
+import sklearn
+import json
+from pathlib import Path
+from streamlit_lottie import st_lottie
+
+from tqdm.auto import tqdm
+from collections import Counter
+from nltk.data import load as nltk_load
+from nltk.tokenize import PunktSentenceTokenizer
+from typing import Callable, List, Tuple
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelWithLMHead, AutoModelForCausalLM
+
+def gpt2_features(text, tokenizer, model, sent_cut):
+    # Tokenize
+    CROSS_ENTROPY = torch.nn.CrossEntropyLoss(reduction='none')
+    NLTK          = PunktSentenceTokenizer()
+    DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    input_max_length = tokenizer.model_max_length - 2
+    token_ids, offsets = list(), list()
+    sentences = sent_cut(text)
+    
+    for s in sentences:
+        tokens = tokenizer.tokenize(s)
+        ids = tokenizer.convert_tokens_to_ids(tokens)
+        difference = len(token_ids) + len(ids) - input_max_length
+        if difference > 0:
+            ids = ids[:-difference]
+        offsets.append((len(token_ids), len(token_ids) + len(ids)))
+        token_ids.extend(ids)
+        if difference >= 0:
+            break
+
+    input_ids = torch.tensor([tokenizer.bos_token_id] + token_ids).to(DEVICE)
+    logits = model(input_ids).logits
+    
+    # Shift so that n-1 predict n
+    shift_logits = logits[:-1].contiguous()
+    shift_target = input_ids[1:].contiguous()
+    loss = CROSS_ENTROPY(shift_logits, shift_target)
+
+    all_probs = torch.softmax(shift_logits, dim=-1)
+    sorted_ids = torch.argsort(all_probs, dim=-1, descending=True)  # stable=True
+    expanded_tokens = shift_target.unsqueeze(-1).expand_as(sorted_ids)
+    indices = torch.where(sorted_ids == expanded_tokens)
+    rank = indices[-1]
+    counter = [
+        rank < 10,
+        (rank >= 10) & (rank < 100),
+        (rank >= 100) & (rank < 1000),
+        rank >= 1000
+    ]
+    counter = [c.long().sum(-1).item() for c in counter]
+
+
+    # compute different-level ppl
+    text_ppl = loss.mean().exp().item()
+    sent_ppl = list()
+    for start, end in offsets:
+        nll = loss[start: end].sum() / (end - start)
+        sent_ppl.append(nll.exp().item())
+        
+    max_sent_ppl = max(sent_ppl)
+    sent_ppl_avg = sum(sent_ppl) / len(sent_ppl)
+    if len(sent_ppl) > 1:
+        sent_ppl_std = torch.std(torch.tensor(sent_ppl)).item()
+    else:
+        sent_ppl_std = 0
+
+    mask = torch.tensor([1] * loss.size(0)).to(DEVICE)
+    step_ppl = loss.cumsum(dim=-1).div(mask.cumsum(dim=-1)).exp()
+    max_step_ppl = step_ppl.max(dim=-1)[0].item()
+    step_ppl_avg = step_ppl.sum(dim=-1).div(loss.size(0)).item()
+    if step_ppl.size(0) > 1:
+        step_ppl_std = step_ppl.std().item()
+    else:
+        step_ppl_std = 0
+    ppls = [
+        text_ppl, max_sent_ppl, sent_ppl_avg, sent_ppl_std,
+        max_step_ppl, step_ppl_avg, step_ppl_std
+    ]
+    return counter, ppls  # type: ignore
 
 def get_result(prompt):
-    # This is a placeholder URL. Replace it with your actual API endpoint.
-    return "Your text is probably an AI - Generated Text with probability of 69%"
+    NLTK        = PunktSentenceTokenizer()
+    DEVICE        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    sent_cut_en = NLTK.tokenize
 
-st.title("💬 AI Generated Text Detector")
-st.caption("🚀 AI Generated Text Detector for Data Science Thesis")
-st.caption("Made By: 2501961994 - Andrew Widjaya")
+    cols = [
+    'text_ppl', 'max_sent_ppl', 'sent_ppl_avg', 'sent_ppl_std', 'max_step_ppl', 
+    'step_ppl_avg', 'step_ppl_std', 'rank_0', 'rank_10', 'rank_100', 'rank_1000'
+    ]
 
-user_input = st.text_area("Your text here")
+    train_feats = []
+    for model in tqdm(['gpt2-large']):
+        TOKENIZER_EN = AutoTokenizer.from_pretrained(f'{model}/tokenizer')
+        MODEL_EN = AutoModelForCausalLM.from_pretrained(f'{model}/model').to(DEVICE)
+        
+        train_ppl_feats = []
+        train_gltr_feats = []
+        with torch.no_grad():
+            gltr, ppl = gpt2_features(prompt, TOKENIZER_EN, MODEL_EN, sent_cut_en)
+            train_ppl_feats.append(ppl)
+            train_gltr_feats.append(gltr)
+        
+        # Create features DataFrame
+        X_train = pd.DataFrame(
+            np.concatenate((train_ppl_feats, train_gltr_feats), axis=1), 
+            columns=[f'{model}-{col}' for col in cols]
+        )
+        
+        # Append to the list
+        train_feats.append(X_train)
 
-if st.button("Get Response"):
-    if user_input:
-        with st.spinner("Getting response from ..."):
-            result = get_result(user_input)
-            st.write("**Response from the model:**")
-            st.write(result)
+    # Concatenate all collected features
+    if train_feats:  # Ensure the list is not empty
+        train_feats = pd.concat(train_feats , axis=1)
     else:
-        st.write("Please enter some text to get a response.")
+        raise ValueError("No features were extracted, check the models and input.")
+
+    # Load the saved model and predict
+    with open('Model_3.pkl', 'rb') as fp:
+        model = pickle.load(fp)
+
+    result = model.predict_proba(train_feats)
+
+    # Assuming binary classification and you want the probability of the positive class
+    percentage = int(result[0][1] * 100)  # Extract the positive class probability and convert to percentage
+
+    return f"The percentage of your text to be generated by AI is {percentage}%"
+
+
+# Helper function to load Lottie animation files
+def load_lottie_file(filepath: str):
+    with open(filepath, "r") as f:
+        return json.load(f)
+
+# Lottie animations
+loading_animation = load_lottie_file("loading_animation.json")  # Replace with your JSON file for loading animation
+success_animation = load_lottie_file("success_animation.json")  # Replace with your JSON file for success animation
+
+st.set_page_config(page_title="AI Text Detector", page_icon="💬", layout="wide")
+
+# App title and introduction
+st.title("💬 AI Generated Text Detector")
+st.markdown(
+    """
+    🚀 **AI Text Detection for Data Science Projects**  
+    Enter any text and see the model's confidence on whether it's AI-generated or human-written.  
+    """
+)
+st.divider()
+
+# Sidebar introduction
+st.sidebar.header("Instructions")
+st.sidebar.write(
+    """
+    - Paste the text in the input box.
+    - Click on "Analyze Text" to process.
+    - Wait for the animation and see the result!
+    """
+)
+
+# User input area with styled text box
+st.markdown("### Your Input Text")
+user_input = st.text_area(
+    "Enter your text below:",
+    height=200,
+    placeholder="Type or paste your text here...",
+)
+
+# Button to trigger analysis
+if st.button("Analyze Text"):
+    if user_input:
+        with st.spinner("Analyzing text... please wait!"):
+            # Simulate an animated response
+            st_lottie(loading_animation, height=200, key="loading")
+            
+            # Process the input and fetch the result (replace with actual model logic)
+            result = get_result(user_input)
+            
+            # Success message with animation
+            st.success("Text successfully analyzed!")
+            st_lottie(success_animation, height=150, key="success")
+            
+            # Display result in a styled card
+            st.markdown(
+                f"""
+                <div style="
+                    background-color: #f0f2f6; 
+                    padding: 20px; 
+                    border-radius: 10px; 
+                    border: 1px solid #d6d8db;">
+                    <h3 style="color: #1a73e8;">Response from the Model:</h3>
+                    <p style="font-size: 18px; color: #333;">{result}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.warning("Please enter some text to analyze.")
+
+# Footer
+st.divider()
+st.caption("🛠 Built with ❤️ using Streamlit")
